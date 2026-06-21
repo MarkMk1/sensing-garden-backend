@@ -154,8 +154,10 @@ resource "aws_iam_role_policy" "trigger_lambda_s3_policy" {
         Action = [
           "s3:PutObject"
         ]
+        # Composites generated server-side, plus every member an hourly archive is
+        # unpacked back into (crops/labels/videos/results.json) under v1/.
         Resource = [
-          "${aws_s3_bucket.output.arn}/v1/*/composites/*"
+          "${aws_s3_bucket.output.arn}/v1/*"
         ]
       }
     ]
