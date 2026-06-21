@@ -132,6 +132,26 @@ resource "aws_s3_bucket" "output" {
   bucket = "scl-sensing-garden"
 }
 
+# Reap abandoned multipart uploads so failed/interrupted device uploads don't
+# leave parts accruing storage cost indefinitely. A multipart upload not
+# completed within this window is aborted by S3. Note: a device resuming a
+# multipart upload after a gap longer than this finds its upload id gone and
+# must restart that upload.
+resource "aws_s3_bucket_lifecycle_configuration" "output" {
+  bucket = aws_s3_bucket.output.id
+
+  rule {
+    id     = "abort-incomplete-multipart-uploads"
+    status = "Enabled"
+
+    filter {}
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
+}
+
 # Configure public access settings for output bucket (private)
 resource "aws_s3_bucket_public_access_block" "output" {
   bucket = aws_s3_bucket.output.id
