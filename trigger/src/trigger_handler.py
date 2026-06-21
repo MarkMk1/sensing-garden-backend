@@ -3,11 +3,14 @@ import logging
 import os
 import re
 import hashlib
+import posixpath
+import tarfile
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import Enum
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple
 from urllib.parse import unquote_plus
@@ -56,10 +59,54 @@ class S3TriggerAction(str, Enum):
 
 
 class ProcessingKind(str, Enum):
+    ARCHIVE = "archive"
     RESULTS = "results"
     HEARTBEAT = "heartbeat"
     ENVIRONMENT = "environment"
     IGNORED = "ignored"
+
+
+# Hourly batch archives (option 2b). A single tar carries a whole hour of already
+# complete per-{datetime} output dirs (results.json + crops/composites/videos/labels)
+# plus heartbeats/environment, with member names equal to their canonical S3 keys.
+ARCHIVE_SUFFIXES = (".tar",)
+
+# Hourly batch archives live in the v2 namespace; their members are canonical
+# v1/ keys, so the archive container is processed even though it is not under v1/.
+ARCHIVE_KEY_PREFIX = "v2/archives/"
+
+# Sidecar files that live next to results.json on the device but must never be
+# written to S3 / processed (they are device-local state).
+ARCHIVE_SKIP_NAMES = frozenset(
+    {".done", ".detection.json", ".expected_tracks", ".completed_tracks", ".uploaded"}
+)
+
+
+def _archive_content_type(name: str) -> str:
+    lowered = name.lower()
+    if lowered.endswith((".jpg", ".jpeg")):
+        return "image/jpeg"
+    if lowered.endswith(".png"):
+        return "image/png"
+    if lowered.endswith(".mp4"):
+        return "video/mp4"
+    if lowered.endswith(".json"):
+        return "application/json"
+    return "application/octet-stream"
+
+
+def _is_safe_archive_member(name: str) -> bool:
+    """Reject anything that is not a canonical v1/ key or that path-traverses."""
+    if not name or name.startswith("/"):
+        return False
+    if not name.startswith("v1/"):
+        return False
+    normalized = posixpath.normpath(name)
+    if normalized != name or normalized.startswith("..") or "/../" in name:
+        return False
+    if Path(name).name in ARCHIVE_SKIP_NAMES:
+        return False
+    return True
 
 
 class ProcessedObjectStatus(str, Enum):
@@ -906,6 +953,123 @@ def process_environment_object(
     return {"environmental_readings": 1}
 
 
+def _merge_summary(total: Dict[str, int], part: Dict[str, int]) -> None:
+    for key, value in part.items():
+        if isinstance(value, (int, float)):
+            total[key] = total.get(key, 0) + value
+
+
+def process_archive_object(
+    storage: StorageAdapter,
+    writer: WriterProtocol,
+    bucket: str,
+    key: str,
+    *,
+    version_id: Optional[str] = None,
+    etag: Optional[str] = None,
+) -> Dict[str, int]:
+    """Unpack an hourly batch tar into canonical S3 keys, then process each member.
+
+    The archive is purely a transport container: every media member is written back to
+    its canonical S3 key so that the resulting S3 state is identical to per-file upload,
+    and each inner results.json / heartbeat / environment object is then handled by the
+    existing per-object processors. A single idempotency claim covers the whole archive
+    (see process_s3_object); inner writes are deterministic and therefore safe to replay.
+    """
+    archive_bytes = storage.read_bytes(bucket, key)
+
+    media_members: List[tarfile.TarInfo] = []
+    results_names: List[str] = []
+    json_object_names: List[str] = []
+
+    summary: Dict[str, int] = {"archives": 1, "result_objects": 0, "skipped_members": 0}
+
+    with tarfile.open(fileobj=BytesIO(archive_bytes), mode="r:*") as tar:
+        members = [m for m in tar.getmembers() if m.isfile()]
+        for member in members:
+            if not _is_safe_archive_member(member.name):
+                summary["skipped_members"] += 1
+                log_s3_trigger(
+                    S3TriggerAction.IGNORED,
+                    bucket,
+                    member.name,
+                    kind=ProcessingKind.ARCHIVE.value,
+                    reason="unsafe_archive_member",
+                    archive_key=key,
+                )
+                continue
+            if member.name.endswith("/results.json"):
+                results_names.append(member.name)
+            elif _processing_kind(member.name) in (ProcessingKind.HEARTBEAT, ProcessingKind.ENVIRONMENT):
+                json_object_names.append(member.name)
+            else:
+                media_members.append(member)
+
+        # Pass 1: materialise all media (crops/composites/videos/labels) so that the
+        # composite generator and crop-key resolution in pass 2 find them in S3.
+        for member in media_members:
+            extracted = tar.extractfile(member)
+            if extracted is None:
+                continue
+            storage.write_bytes(bucket, member.name, extracted.read(), _archive_content_type(member.name))
+
+        # Pass 2: results.json (written then processed). Continue-on-inner-error so one
+        # poison results.json cannot strand the rest of the hour.
+        for name in results_names:
+            member = tar.getmember(name)
+            extracted = tar.extractfile(member)
+            if extracted is None:
+                continue
+            storage.write_bytes(bucket, name, extracted.read(), "application/json")
+            try:
+                part = process_results_object(storage, writer, bucket, name)
+                _merge_summary(summary, part)
+                summary["result_objects"] += 1
+            except Exception as exc:
+                summary["skipped_members"] += 1
+                log_s3_trigger(
+                    S3TriggerAction.FAILED,
+                    bucket,
+                    name,
+                    kind=ProcessingKind.RESULTS.value,
+                    reason="archive_member_failed",
+                    archive_key=key,
+                    error=str(exc),
+                )
+
+        # Heartbeats / environment carried in the archive.
+        for name in json_object_names:
+            member = tar.getmember(name)
+            extracted = tar.extractfile(member)
+            if extracted is None:
+                continue
+            storage.write_bytes(bucket, name, extracted.read(), "application/json")
+            member_kind = _processing_kind(name)
+            try:
+                if member_kind == ProcessingKind.HEARTBEAT:
+                    part = process_heartbeat_object(storage, writer, bucket, name)
+                else:
+                    part = process_environment_object(storage, writer, bucket, name)
+                _merge_summary(summary, part)
+            except Exception as exc:
+                summary["skipped_members"] += 1
+                log_s3_trigger(
+                    S3TriggerAction.FAILED,
+                    bucket,
+                    name,
+                    kind=member_kind.value,
+                    reason="archive_member_failed",
+                    archive_key=key,
+                    error=str(exc),
+                )
+
+    print(
+        f"Processed archive {key}: {summary['result_objects']} result object(s), "
+        f"{summary.get('tracks', 0)} tracks, {summary.get('classifications', 0)} classifications"
+    )
+    return summary
+
+
 def parse_s3_event(event: Dict[str, Any]) -> List[S3ObjectEvent]:
     records: List[S3ObjectEvent] = []
     for record in event.get("Records", []):
@@ -937,6 +1101,8 @@ def _processing_status(summary: Dict[str, int]) -> str:
 
 
 def _processing_kind(key: str) -> ProcessingKind:
+    if key.startswith(ARCHIVE_KEY_PREFIX) and key.endswith(ARCHIVE_SUFFIXES):
+        return ProcessingKind.ARCHIVE
     if key.endswith("/results.json"):
         return ProcessingKind.RESULTS
     if HEARTBEAT_KEY_PATTERN.match(key):
@@ -997,7 +1163,8 @@ def process_s3_object(
 ) -> Dict[str, int]:
     kind = _processing_kind(event.key)
     log_s3_trigger(S3TriggerAction.RECEIVED, event.bucket, event.key, kind=kind.value)
-    if not event.key.startswith("v1/"):
+    # Archives are the one supported object outside v1/: they unpack to v1/ keys.
+    if kind != ProcessingKind.ARCHIVE and not event.key.startswith("v1/"):
         log_s3_trigger(S3TriggerAction.IGNORED, event.bucket, event.key, reason="outside_v1_prefix")
         activity.record_object_ignored(event.bucket, event.key, activity.TriggerFailureReason.OUTSIDE_V1_PREFIX)
         return {}
@@ -1018,7 +1185,16 @@ def process_s3_object(
     try:
         activity.record_s3_received(event.bucket, event.key, kind.value)
         log_s3_trigger(S3TriggerAction.PROCESSING, event.bucket, event.key, kind=kind.value)
-        if kind == ProcessingKind.RESULTS:
+        if kind == ProcessingKind.ARCHIVE:
+            summary = process_archive_object(
+                storage,
+                writer,
+                event.bucket,
+                event.key,
+                version_id=event.version_id,
+                etag=event.etag,
+            )
+        elif kind == ProcessingKind.RESULTS:
             summary = process_results_object(
                 storage,
                 writer,
