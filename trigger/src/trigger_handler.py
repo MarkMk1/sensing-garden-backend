@@ -169,6 +169,9 @@ class StorageAdapter:
     def read_bytes(self, bucket: str, key: str) -> bytes:
         raise NotImplementedError
 
+    def read_range(self, bucket: str, key: str, offset: int, size: int) -> bytes:
+        raise NotImplementedError
+
     def write_bytes(self, bucket: str, key: str, body: bytes, content_type: str) -> None:
         raise NotImplementedError
 
@@ -201,6 +204,12 @@ class S3StorageAdapter(StorageAdapter):
 
     def read_bytes(self, bucket: str, key: str) -> bytes:
         response = self.client.get_object(Bucket=bucket, Key=key)
+        return response["Body"].read()
+
+    def read_range(self, bucket: str, key: str, offset: int, size: int) -> bytes:
+        response = self.client.get_object(
+            Bucket=bucket, Key=key, Range=f"bytes={offset}-{offset + size - 1}"
+        )
         return response["Body"].read()
 
     def write_bytes(self, bucket: str, key: str, body: bytes, content_type: str) -> None:
@@ -243,6 +252,11 @@ class LocalStorageAdapter(StorageAdapter):
 
     def read_bytes(self, bucket: str, key: str) -> bytes:
         return self._path(key).read_bytes()
+
+    def read_range(self, bucket: str, key: str, offset: int, size: int) -> bytes:
+        with open(self._path(key), "rb") as handle:
+            handle.seek(offset)
+            return handle.read(size)
 
     def write_bytes(self, bucket: str, key: str, body: bytes, content_type: str) -> None:
         path = self._path(key)
@@ -294,6 +308,58 @@ class TarStorageAdapter(StorageAdapter):
     def _member_bytes(self, key: str) -> bytes:
         offset, size = self._ranges[key]
         return self._archive_bytes[offset:offset + size]
+
+    def read_text(self, bucket, key, *, version_id=None, etag=None) -> str:
+        if key in self._ranges:
+            return self._member_bytes(key).decode("utf-8")
+        return self._fallback.read_text(bucket, key, version_id=version_id, etag=etag)
+
+    def read_bytes(self, bucket: str, key: str) -> bytes:
+        if key in self._ranges:
+            return self._member_bytes(key)
+        return self._fallback.read_bytes(bucket, key)
+
+    def write_bytes(self, bucket: str, key: str, body: bytes, content_type: str) -> None:
+        self._fallback.write_bytes(bucket, key, body, content_type)
+
+    def exists(self, bucket: str, key: str) -> bool:
+        return key in self._ranges or self._fallback.exists(bucket, key)
+
+    def list_keys(self, bucket: str, prefix: str, suffix: str = "") -> List[str]:
+        members = [k for k in self._ranges if k.startswith(prefix) and (not suffix or k.endswith(suffix))]
+        return sorted(set(members) | set(self._fallback.list_keys(bucket, prefix, suffix)))
+
+
+class RangedTarStorageAdapter(StorageAdapter):
+    """Reads tar members by ranged GET using a sibling offset index, so the whole
+    archive is never pulled into the Lambda -- only the small JSON members it must
+    parse are fetched (results.json/labels/heartbeat/environment); crops are merely
+    existence-checked via the index. Non-members defer to S3; generated composites
+    are written through to S3.
+    """
+
+    def __init__(self, fallback: StorageAdapter, bucket: str, archive_key: str, index: Dict[str, Any]) -> None:
+        self._fallback = fallback
+        self._bucket = bucket
+        self._archive_key = archive_key
+        self._ranges: Dict[str, Tuple[int, int]] = {
+            name: (int(entry["offset"]), int(entry["size"]))
+            for name, entry in index.items()
+            if _is_safe_archive_member(name)
+        }
+        self._cache: Dict[str, bytes] = {}
+
+    def member_names(self) -> List[str]:
+        return list(self._ranges)
+
+    def member_range(self, key: str) -> Optional[Tuple[int, int]]:
+        return self._ranges.get(key)
+
+    def _member_bytes(self, key: str) -> bytes:
+        if key not in self._cache:
+            offset, size = self._ranges[key]
+            self._cache[key] = self._fallback.read_range(self._bucket, self._archive_key, offset, size)
+        return self._cache[key]
 
     def read_text(self, bucket, key, *, version_id=None, etag=None) -> str:
         if key in self._ranges:
@@ -1042,6 +1108,19 @@ def _merge_summary(total: Dict[str, int], part: Dict[str, int]) -> None:
             total[key] = total.get(key, 0) + value
 
 
+def _load_archive_index(storage: StorageAdapter, bucket: str, key: str) -> Optional[Dict[str, Any]]:
+    """Load the sibling ``<key>.idx`` offset map, or None if absent/malformed."""
+    index_key = key + ".idx"
+    if not storage.exists(bucket, index_key):
+        return None
+    try:
+        payload = storage.read_json(bucket, index_key)
+    except Exception:  # noqa: BLE001 - a malformed index just falls back to full read
+        return None
+    members = payload.get("members")
+    return members if isinstance(members, dict) else None
+
+
 def process_archive_object(
     storage: StorageAdapter,
     writer: WriterProtocol,
@@ -1059,8 +1138,14 @@ def process_archive_object(
     byte range so serving can range-read. A single idempotency claim covers the
     whole archive (see process_s3_object); inner writes are deterministic upserts.
     """
-    archive_bytes = storage.read_bytes(bucket, key)
-    adapter = TarStorageAdapter(archive_bytes, storage)
+    index = _load_archive_index(storage, bucket, key)
+    if index is not None:
+        # Metadata-only ingest: read member byte ranges from the sibling .idx and
+        # range-GET only the JSON members; never pull the whole archive.
+        adapter: StorageAdapter = RangedTarStorageAdapter(storage, bucket, key, index)
+    else:
+        # No index (older device, or .idx missing): fall back to a full read.
+        adapter = TarStorageAdapter(storage.read_bytes(bucket, key), storage)
     index_writer = ArchiveIndexWriter(writer, adapter, bucket, key)
 
     summary: Dict[str, int] = {"archives": 1, "result_objects": 0, "skipped_members": 0}
