@@ -1123,6 +1123,15 @@ def _merge_summary(total: Dict[str, int], part: Dict[str, int]) -> None:
             total[key] = total.get(key, 0) + value
 
 
+def _flush_collected_writes(writer: WriterProtocol, collected: "CollectingWriter") -> None:
+    writer.put_tracks(collected.tracks)
+    writer.put_classifications(collected.classifications)
+    writer.put_devices_if_missing(collected.devices)
+    writer.put_videos(collected.videos)
+    writer.put_heartbeats(collected.heartbeats)
+    writer.put_environmental_readings(collected.environmental_readings)
+
+
 def process_archive_object(
     storage: StorageAdapter,
     writer: WriterProtocol,
@@ -1137,12 +1146,16 @@ def process_archive_object(
     The media stays inside the archive; a tar-backed StorageAdapter feeds the
     existing per-object processors so the same DynamoDB rows are written, and an
     ArchiveIndexWriter stamps each row with the archive location + the member's
-    byte range so serving can range-read. A single idempotency claim covers the
+    byte range so serving can range-read. Per-member writes land in an in-memory
+    CollectingWriter and are flushed to the real writer once at the end, so a tar
+    with many members batches its DynamoDB writes across the whole archive instead
+    of opening a separate batch per member. A single idempotency claim covers the
     whole archive (see process_s3_object); inner writes are deterministic upserts.
     """
     archive_bytes = storage.read_bytes(bucket, key)
     adapter = TarStorageAdapter(archive_bytes, storage)
-    index_writer = ArchiveIndexWriter(writer, adapter, bucket, key)
+    collected = CollectingWriter()
+    index_writer = ArchiveIndexWriter(collected, adapter, bucket, key)
 
     summary: Dict[str, int] = {"archives": 1, "result_objects": 0, "skipped_members": 0}
     results_names: List[str] = []
@@ -1197,6 +1210,7 @@ def process_archive_object(
                 reason="archive_member_failed", archive_key=key, error=str(exc),
             )
 
+    _flush_collected_writes(writer, collected)
     return summary
 
 
