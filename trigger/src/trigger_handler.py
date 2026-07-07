@@ -333,12 +333,12 @@ class DynamoWriter:
         self.environmental_readings = resource.Table(ENVIRONMENTAL_TABLE)
 
     def put_tracks(self, items: List[Dict[str, Any]]) -> None:
-        with self.tracks.batch_writer() as batch:
+        with self.tracks.batch_writer(overwrite_by_pkeys=["track_id", "device_id"]) as batch:
             for item in items:
                 batch.put_item(Item=item)
 
     def put_classifications(self, items: List[Dict[str, Any]]) -> None:
-        with self.classifications.batch_writer() as batch:
+        with self.classifications.batch_writer(overwrite_by_pkeys=["device_id", "timestamp"]) as batch:
             for item in items:
                 batch.put_item(Item=item)
 
@@ -363,17 +363,17 @@ class DynamoWriter:
                     raise
 
     def put_videos(self, items: List[Dict[str, Any]]) -> None:
-        with self.videos.batch_writer() as batch:
+        with self.videos.batch_writer(overwrite_by_pkeys=["device_id", "timestamp"]) as batch:
             for item in items:
                 batch.put_item(Item=item)
 
     def put_heartbeats(self, items: List[Dict[str, Any]]) -> None:
-        with self.heartbeats.batch_writer() as batch:
+        with self.heartbeats.batch_writer(overwrite_by_pkeys=["device_id", "timestamp"]) as batch:
             for item in items:
                 batch.put_item(Item=item)
 
     def put_environmental_readings(self, items: List[Dict[str, Any]]) -> None:
-        with self.environmental_readings.batch_writer() as batch:
+        with self.environmental_readings.batch_writer(overwrite_by_pkeys=["device_id", "timestamp"]) as batch:
             for item in items:
                 batch.put_item(Item=item)
 

@@ -176,6 +176,55 @@ def test_process_archive_object_isolates_per_member_parse_failures():
     assert [item["device_id"] for item in writer.tracks] == ["device-good"]
 
 
+def test_dynamo_writer_dedupes_batches_by_table_primary_key(monkeypatch):
+    """Records from different archive members can share a primary key (e.g. two
+    videos whose derived timestamps land on the same second). They now meet in
+    one batch_writer context, and DynamoDB rejects a BatchWriteItem request
+    holding duplicate keys — so every batched put must dedupe via
+    overwrite_by_pkeys matching the table's key schema (terraform/dynamodb.tf)."""
+
+    class StubBatch:
+        def __init__(self) -> None:
+            self.items: List[Dict[str, Any]] = []
+
+        def put_item(self, Item: Dict[str, Any]) -> None:
+            self.items.append(Item)
+
+        def __enter__(self) -> "StubBatch":
+            return self
+
+        def __exit__(self, *exc_info: object) -> None:
+            pass
+
+    class StubTable:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.pkeys: List[str] | None = None
+
+        def batch_writer(self, overwrite_by_pkeys=None) -> StubBatch:
+            self.pkeys = overwrite_by_pkeys
+            return StubBatch()
+
+    class StubResource:
+        def Table(self, name: str) -> StubTable:
+            return StubTable(name)
+
+    monkeypatch.setattr(trigger_handler.boto3, "resource", lambda service: StubResource())
+    writer = trigger_handler.DynamoWriter()
+
+    writer.put_tracks([])
+    writer.put_classifications([])
+    writer.put_videos([])
+    writer.put_heartbeats([])
+    writer.put_environmental_readings([])
+
+    assert writer.tracks.pkeys == ["track_id", "device_id"]
+    assert writer.classifications.pkeys == ["device_id", "timestamp"]
+    assert writer.videos.pkeys == ["device_id", "timestamp"]
+    assert writer.heartbeats.pkeys == ["device_id", "timestamp"]
+    assert writer.environmental_readings.pkeys == ["device_id", "timestamp"]
+
+
 def test_process_archive_object_propagates_flush_failure_for_whole_archive():
     """A failure during the final flush is not swallowed per-member: it aborts and
     propagates so the caller (process_s3_object) retries the whole archive, rather
