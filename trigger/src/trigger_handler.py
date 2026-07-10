@@ -534,6 +534,10 @@ class ArchiveIndexWriter:
         item["archive_key"] = self._archive_key
         item[f"{prefix}_offset"] = offset
         item[f"{prefix}_size"] = size
+        # The key is now a member path inside the tar, not an object at
+        # {prefix}_bucket -- drop the bucket so the row doesn't carry a
+        # dangling flat-object pointer.
+        item.pop(f"{prefix}_bucket", None)
 
     def put_tracks(self, items: List[Dict[str, Any]]) -> None:
         for item in items:

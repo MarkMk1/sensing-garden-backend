@@ -28,7 +28,10 @@ def recorded_presigns(monkeypatch):
 
 def test_add_presigned_urls_uses_archive_for_stamped_video_row(recorded_presigns):
     """An archived row's video_key is a path inside the tar, not a real object at
-    video_bucket -- the presign target must be the archive, not the member path."""
+    video_bucket -- the presign target must be the archive, not the member path.
+
+    Carries a (dangling) video_bucket: rows stamped before the bucket was dropped
+    from stamping still have one, and must keep serving from the archive."""
     item = {
         "video_key": "v1/FLIK4/20260625_141636/video.mp4",
         "video_bucket": "scl-sensing-garden-videos",
@@ -81,6 +84,39 @@ def test_add_presigned_urls_uses_archive_for_stamped_image_row(recorded_presigns
     assert result["items"][0]["image_url"] == (
         "https://example.invalid/scl-sensing-garden/v2/archives/FLIK4/20260625_150000.tar"
     )
+
+
+def test_add_presigned_urls_archived_rows_without_bucket_still_get_urls(recorded_presigns):
+    """Stamping no longer writes {prefix}_bucket (the member is not a flat object),
+    so the url gate must not require the bucket field."""
+    image_row = {
+        "image_key": "v1/FLIK4/20260625_141636/crop_0.jpg",
+        "archive_key": "v2/archives/FLIK4/20260625_150000.tar",
+        "archive_bucket": "scl-sensing-garden",
+        "image_offset": 2048,
+        "image_size": 256,
+    }
+    video_row = {
+        "video_key": "v1/FLIK4/20260625_141636/video.mp4",
+        "archive_key": "v2/archives/FLIK4/20260625_150000.tar",
+        "archive_bucket": "scl-sensing-garden",
+        "video_offset": 512,
+        "video_size": 1024,
+    }
+
+    result = s3._add_presigned_urls({"items": [image_row, video_row]})
+
+    archive_url = "https://example.invalid/scl-sensing-garden/v2/archives/FLIK4/20260625_150000.tar"
+    assert result["items"][0]["image_url"] == archive_url
+    assert result["items"][1]["video_url"] == archive_url
+
+
+def test_add_presigned_urls_key_without_bucket_or_archive_yields_none(recorded_presigns):
+    """A malformed row (key but neither bucket nor archive) gets url=None, not a crash."""
+    result = s3._add_presigned_urls({"items": [{"image_key": "v1/FLIK4/x/crop_0.jpg"}]})
+
+    assert recorded_presigns == []
+    assert result["items"][0]["image_url"] is None
 
 
 def test_add_composite_url_uses_archive_for_stamped_composite_row(recorded_presigns):

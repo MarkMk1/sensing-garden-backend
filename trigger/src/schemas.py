@@ -12,6 +12,12 @@ from pydantic import BaseModel, Field
 
 
 class Track(BaseModel):
+    """A stored row is *archived* when it carries archive_key/archive_bucket
+    (stamped by ArchiveIndexWriter after validation, along with
+    composite_offset/composite_size): its media was ingested inside a batch tar
+    and composite_key is the member path within that tar, not a standalone S3
+    object. Otherwise composite_key is a flat S3 key."""
+
     track_id: str
     device_id: str
     timestamp: str
@@ -29,12 +35,18 @@ class Track(BaseModel):
 
 
 class Classification(BaseModel):
+    """A stored row is *archived* when it carries archive_key/archive_bucket
+    (stamped by ArchiveIndexWriter after validation, along with
+    image_offset/image_size): image_key is the member path within that tar and
+    image_bucket is absent, since there is no flat object to point at.
+    Otherwise image_key/image_bucket name a flat S3 object."""
+
     device_id: str
     timestamp: str
     track_id: str
     model_id: str
     image_key: str
-    image_bucket: str
+    image_bucket: Optional[str] = None
     family: str
     genus: str
     species: str
@@ -109,10 +121,16 @@ class EnvironmentalReading(BaseModel):
 
 
 class Video(BaseModel):
+    """A stored row is *archived* when it carries archive_key/archive_bucket
+    (stamped by ArchiveIndexWriter after validation, along with
+    video_offset/video_size): video_key is the member path within that tar and
+    video_bucket is absent, since there is no flat object to point at.
+    Otherwise video_key/video_bucket name a flat S3 object."""
+
     device_id: str
     timestamp: str
     video_key: str
-    video_bucket: str
+    video_bucket: Optional[str] = None
     s3_prefix: Optional[str] = None
     fps: Optional[float] = None
     total_frames: Optional[int] = None

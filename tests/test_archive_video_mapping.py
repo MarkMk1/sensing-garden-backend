@@ -109,12 +109,35 @@ def test_archive_video_only_member_is_mapped():
     assert row["device_id"] == "FLIK4"
     assert row["timestamp"] == "2026-06-25T14:16:36"
     assert row["video_key"] == key
-    assert row["video_bucket"] == BUCKET
+    # stamped row: video_key is a tar member path, not an object at any bucket,
+    # so the flat-object pointer must not be persisted
+    assert "video_bucket" not in row
     assert row["archive_bucket"] == BUCKET
     assert row["archive_key"] == ARCHIVE_KEY
     off, size = row["video_offset"], row["video_size"]
     assert archive_bytes[off:off + size] == video_bytes
     assert summary["videos"] == 1
+
+
+# --- stamping a classification drops its dangling image_bucket, same as videos ---
+
+def test_stamped_classification_drops_image_bucket():
+    class _RangeAdapter:
+        def member_range(self, key):
+            return (128, 64) if key == "v1/FLIK4/20260625_141636/crop_0.jpg" else None
+
+    inner = trigger_handler.CollectingWriter()
+    writer = trigger_handler.ArchiveIndexWriter(inner, _RangeAdapter(), BUCKET, ARCHIVE_KEY)
+    writer.put_classifications([{
+        "image_key": "v1/FLIK4/20260625_141636/crop_0.jpg",
+        "image_bucket": BUCKET,
+    }])
+
+    row = inner.classifications[0]
+    assert "image_bucket" not in row
+    assert row["archive_key"] == ARCHIVE_KEY
+    assert row["archive_bucket"] == BUCKET
+    assert (row["image_offset"], row["image_size"]) == (128, 64)
 
 
 # --- E3: co-located results.json + video -> one enriched row, no duplicate ---

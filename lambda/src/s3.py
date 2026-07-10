@@ -73,10 +73,13 @@ def _presign_media(
 
 
 def _add_presigned_urls(result: Dict[str, Any]) -> Dict[str, Any]:
+    # Keyed on the key field alone: archived rows carry no {prefix}_bucket
+    # (their media is a tar member, served via archive_key), so requiring the
+    # bucket here would skip them.
     for item in result.get("items", []):
-        if "image_key" in item and "image_bucket" in item:
+        if "image_key" in item:
             item["image_url"] = _presign_media(item, "image_key", "image")
-        if "video_key" in item and "video_bucket" in item:
+        if "video_key" in item:
             item["video_url"] = _presign_media(item, "video_key", "video")
     return result
 
